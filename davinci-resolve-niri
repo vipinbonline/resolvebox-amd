@@ -1,0 +1,747 @@
+#!/usr/bin/env bash
+
+# SPDX-License-Identifier: Apache-2.0
+#
+# Copyright 2026 Vipin Balakrishnan
+
+set -Eeuo pipefail
+IFS=$'\n\t'
+umask 077
+
+# ==============================================================================
+# DaVinci Resolve + Distrobox + Niri launcher
+#
+# Purpose:
+#   1. Select a Distrobox with Rofi.
+#   2. Start DaVinci Resolve inside that Distrobox.
+#   3. Detect Resolve's X11 "Project Manager" window.
+#   4. Work around the Resolve/xwayland-satellite transient-window issue.
+#   5. Verify that Niri actually sees the repaired window.
+#
+# IMPORTANT:
+#   Run this script on the Niri HOST, not from inside Distrobox.
+# ==============================================================================
+
+
+# ------------------------------------------------------------------------------
+# Configuration
+# ------------------------------------------------------------------------------
+
+readonly APP_NAME="DaVinci Resolve Launcher"
+
+readonly WINDOW_TIMEOUT_SECONDS=60
+readonly POLL_INTERVAL_SECONDS=0.25
+
+readonly REMAP_ATTEMPTS=3
+readonly REMAP_DELAY_SECONDS=0.50
+readonly NIRI_VERIFY_TIMEOUT_SECONDS=4
+
+# Your AMD OpenCL ICD.
+#
+# Change this here if you ever move to a different OpenCL provider.
+readonly OPENCL_VENDOR="amdocl64.icd"
+
+
+# ------------------------------------------------------------------------------
+# Runtime paths
+# ------------------------------------------------------------------------------
+
+readonly STATE_DIR="${XDG_STATE_HOME:-${HOME}/.local/state}/davinci-resolve-launcher"
+readonly RUNTIME_DIR="${XDG_RUNTIME_DIR:-/tmp}"
+
+mkdir -p "${STATE_DIR}"
+
+readonly LOG_FILE="${STATE_DIR}/resolve-$(date '+%Y%m%d-%H%M%S').log"
+readonly LATEST_LOG="${STATE_DIR}/latest.log"
+readonly LOCK_FILE="${RUNTIME_DIR}/davinci-resolve-launcher-${UID}.lock"
+
+touch "${LOG_FILE}"
+
+ln -sfn "$(basename "${LOG_FILE}")" "${LATEST_LOG}"
+
+
+# ------------------------------------------------------------------------------
+# Logging / notifications
+# ------------------------------------------------------------------------------
+
+log()
+{
+    local level="$1"
+    shift
+
+    printf '%s [%s] %s\n' \
+        "$(date '+%Y-%m-%d %H:%M:%S')" \
+        "${level}" \
+        "$*" \
+        >> "${LOG_FILE}"
+}
+
+
+notify()
+{
+    local urgency="$1"
+    local title="$2"
+    local message="$3"
+
+    notify-send \
+        --app-name="${APP_NAME}" \
+        --urgency="${urgency}" \
+        --hint="string:x-canonical-private-synchronous:davinci-resolve-launcher" \
+        "${title}" \
+        "${message}" \
+        >/dev/null 2>&1 || true
+}
+
+
+die()
+{
+    local message="$1"
+    local exit_code="${2:-1}"
+
+    log "ERROR" "${message}"
+
+    notify \
+        "critical" \
+        "DaVinci Resolve failed" \
+        "${message}
+
+Log: ${LATEST_LOG}"
+
+    exit "${exit_code}"
+}
+
+
+unexpected_error()
+{
+    local exit_code="$?"
+    local line="$1"
+
+    trap - ERR
+
+    log "ERROR" \
+        "Unexpected failure at line ${line}; exit code ${exit_code}"
+
+    notify \
+        "critical" \
+        "DaVinci Resolve launcher error" \
+        "Unexpected failure at line ${line}.
+
+Log: ${LATEST_LOG}"
+
+    exit "${exit_code}"
+}
+
+trap 'unexpected_error "${LINENO}"' ERR
+
+
+# ------------------------------------------------------------------------------
+# Dependency checks
+# ------------------------------------------------------------------------------
+
+require_command()
+{
+    local command_name="$1"
+
+    if ! command -v "${command_name}" >/dev/null 2>&1; then
+        die "Required command is missing: ${command_name}" 127
+    fi
+}
+
+
+# notify-send must exist before we can report the remaining dependencies.
+if ! command -v notify-send >/dev/null 2>&1; then
+    printf 'Missing required command: notify-send\n' >&2
+    exit 127
+fi
+
+for command_name in \
+    distrobox \
+    rofi \
+    xwininfo \
+    xprop \
+    xdotool \
+    niri \
+    flock \
+    awk
+do
+    require_command "${command_name}"
+done
+
+
+# ------------------------------------------------------------------------------
+# Sanity checks
+# ------------------------------------------------------------------------------
+
+# This launcher needs access to the host XWayland and Niri session.
+if [[ -f /run/.containerenv || -f /.dockerenv ]]; then
+    die "Run this launcher on the Niri host, not from inside Distrobox."
+fi
+
+
+if [[ -z "${DISPLAY:-}" ]]; then
+    die "DISPLAY is not set. XWayland is not available to this launcher."
+fi
+
+
+if ! niri msg windows >/dev/null 2>&1; then
+    die "Unable to communicate with the current Niri session."
+fi
+
+
+# ------------------------------------------------------------------------------
+# Prevent concurrent launcher instances
+# ------------------------------------------------------------------------------
+
+exec 9>"${LOCK_FILE}"
+
+if ! flock -n 9; then
+    notify \
+        "normal" \
+        "DaVinci Resolve launcher" \
+        "Another Resolve launcher is already running."
+
+    exit 0
+fi
+
+
+# ------------------------------------------------------------------------------
+# Distrobox discovery
+# ------------------------------------------------------------------------------
+
+declare -a BOX_ROWS=()
+declare -a BOX_NAMES=()
+
+SELECTED_BOX=""
+
+
+load_distroboxes()
+{
+    local listing
+    local row
+
+    log "INFO" "Reading available Distrobox containers"
+
+    if ! listing="$(NO_COLOR=1 distrobox list 2>>"${LOG_FILE}")"; then
+        die "Unable to obtain the Distrobox list."
+    fi
+
+    mapfile -t BOX_ROWS < <(
+        awk -F'|' '
+            NR > 1 {
+                name   = $2
+                status = $3
+                image  = $4
+
+                gsub(/^[[:space:]]+|[[:space:]]+$/, "", name)
+                gsub(/^[[:space:]]+|[[:space:]]+$/, "", status)
+                gsub(/^[[:space:]]+|[[:space:]]+$/, "", image)
+
+                if (name != "") {
+                    printf "%s\t%s\t%s\n", name, status, image
+                }
+            }
+        ' <<< "${listing}"
+    )
+
+    if (( ${#BOX_ROWS[@]} == 0 )); then
+        die "No Distrobox containers were found."
+    fi
+
+    BOX_NAMES=()
+
+    for row in "${BOX_ROWS[@]}"; do
+        BOX_NAMES+=( "${row%%$'\t'*}" )
+    done
+}
+
+
+box_exists()
+{
+    local requested="$1"
+    local name
+
+    for name in "${BOX_NAMES[@]}"; do
+        if [[ "${name}" == "${requested}" ]]; then
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+
+select_distrobox()
+{
+    local selection
+
+    if ! selection="$(
+        printf '%s\n' "${BOX_ROWS[@]}" |
+            rofi \
+                -dmenu \
+                -i \
+                -p "DaVinci Distrobox" \
+                -mesg "Select the container containing DaVinci Resolve"
+    )"; then
+        log "INFO" "Distrobox selection cancelled"
+        exit 0
+    fi
+
+    if [[ -z "${selection}" ]]; then
+        log "INFO" "Distrobox selection cancelled"
+        exit 0
+    fi
+
+    SELECTED_BOX="${selection%%$'\t'*}"
+}
+
+
+# ------------------------------------------------------------------------------
+# Resolve validation
+# ------------------------------------------------------------------------------
+
+validate_resolve_installation()
+{
+    local box="$1"
+
+    log "INFO" "Checking Resolve installation in Distrobox: ${box}"
+
+    if distrobox enter "${box}" -- bash -lc '
+        if command -v run-davinci >/dev/null 2>&1; then
+            exit 0
+        fi
+
+        if [[ -x /opt/resolve/bin/resolve ]]; then
+            exit 0
+        fi
+
+        exit 1
+    ' \
+        9>&- \
+        >>"${LOG_FILE}" 2>&1; then
+        return 0
+    fi
+
+    return 1
+}
+
+
+# ------------------------------------------------------------------------------
+# Niri / X11 window detection
+# ------------------------------------------------------------------------------
+
+niri_has_resolve_window()
+{
+    local windows
+
+    if ! windows="$(niri msg windows 2>>"${LOG_FILE}")"; then
+        return 1
+    fi
+
+    awk '
+        /App ID: "resolve"/ {
+            found = 1
+        }
+
+        END {
+            exit(found ? 0 : 1)
+        }
+    ' <<< "${windows}"
+}
+
+
+niri_has_project_manager()
+{
+    local windows
+
+    if ! windows="$(niri msg windows 2>>"${LOG_FILE}")"; then
+        return 1
+    fi
+
+    awk '
+        /^Window ID / {
+            title = 0
+            app   = 0
+        }
+
+        /Title: "Project Manager"/ {
+            title = 1
+        }
+
+        /App ID: "resolve"/ {
+            app = 1
+        }
+
+        title && app {
+            found = 1
+        }
+
+        END {
+            exit(found ? 0 : 1)
+        }
+    ' <<< "${windows}"
+}
+
+
+FOUND_WINDOW=""
+
+
+find_project_manager()
+{
+    local tree
+
+    FOUND_WINDOW=""
+
+    if ! tree="$(xwininfo -root -tree 2>>"${LOG_FILE}")"; then
+        return 1
+    fi
+
+    FOUND_WINDOW="$(
+        awk '
+            /"Project Manager"/ &&
+            /\("resolve" "resolve"\)/ &&
+            !found {
+                window = $1
+                found = 1
+            }
+
+            END {
+                if (found) {
+                    print window
+                }
+            }
+        ' <<< "${tree}"
+    )"
+
+    [[ -n "${FOUND_WINDOW}" ]]
+}
+
+
+# ------------------------------------------------------------------------------
+# Resolve / xwayland-satellite workaround
+# ------------------------------------------------------------------------------
+
+remap_project_manager()
+{
+    local window_id="$1"
+
+    log "INFO" \
+        "Repairing Project Manager X11 window ${window_id}"
+
+    # Capture its original relationship for troubleshooting.
+    xprop \
+        -id "${window_id}" \
+        WM_NAME \
+        WM_CLASS \
+        WM_TRANSIENT_FOR \
+        _NET_WM_STATE \
+        _NET_WM_WINDOW_TYPE \
+        >>"${LOG_FILE}" 2>&1 || true
+
+    # This is the important workaround.
+    #
+    # Resolve creates the Project Manager as a transient/modal child of a
+    # hidden 1x1 Qt owner window. xwayland-satellite/Niri may consequently
+    # fail to expose it as a Wayland toplevel.
+    if ! xprop \
+        -id "${window_id}" \
+        -remove WM_TRANSIENT_FOR \
+        >>"${LOG_FILE}" 2>&1;
+    then
+        log "WARN" \
+            "Unable to remove WM_TRANSIENT_FOR from ${window_id}"
+
+        return 1
+    fi
+
+    if ! xdotool \
+        windowunmap "${window_id}" \
+        >>"${LOG_FILE}" 2>&1;
+    then
+        log "WARN" \
+            "Unable to unmap Project Manager ${window_id}"
+
+        return 1
+    fi
+
+    sleep "${REMAP_DELAY_SECONDS}"
+
+    if ! xdotool \
+        windowmap "${window_id}" \
+        >>"${LOG_FILE}" 2>&1;
+    then
+        log "WARN" \
+            "Unable to remap Project Manager ${window_id}"
+
+        return 1
+    fi
+
+    return 0
+}
+
+
+wait_for_niri_project_manager()
+{
+    local deadline=$((SECONDS + NIRI_VERIFY_TIMEOUT_SECONDS))
+
+    while (( SECONDS < deadline )); do
+
+        if niri_has_project_manager; then
+            return 0
+        fi
+
+        sleep "${POLL_INTERVAL_SECONDS}"
+    done
+
+    return 1
+}
+
+
+repair_with_retries()
+{
+    local window_id="$1"
+    local attempt
+
+    for (( attempt = 1; attempt <= REMAP_ATTEMPTS; attempt++ )); do
+
+        log "INFO" \
+            "Project Manager repair attempt ${attempt}/${REMAP_ATTEMPTS}"
+
+        if remap_project_manager "${window_id}"; then
+
+            if wait_for_niri_project_manager; then
+                log "INFO" \
+                    "Niri accepted Project Manager window ${window_id}"
+
+                return 0
+            fi
+
+            log "WARN" \
+                "Project Manager remapped but is still absent from Niri"
+        fi
+
+        sleep "${REMAP_DELAY_SECONDS}"
+    done
+
+    return 1
+}
+
+
+# ------------------------------------------------------------------------------
+# Resolve launch
+# ------------------------------------------------------------------------------
+
+LAUNCHER_PID=""
+
+
+launch_resolve()
+{
+    local box="$1"
+
+    log "INFO" \
+        "Launching DaVinci Resolve in Distrobox: ${box}"
+
+    nohup \
+        distrobox enter "${box}" -- \
+        env \
+            QT_QPA_PLATFORM=xcb \
+            OCL_ICD_VENDORS="${OPENCL_VENDOR}" \
+        bash -lc '
+            if command -v run-davinci >/dev/null 2>&1; then
+                exec run-davinci
+            fi
+
+            if [[ -x /opt/resolve/bin/resolve ]]; then
+                exec /opt/resolve/bin/resolve
+            fi
+
+            printf "%s\n" \
+                "DaVinci Resolve executable was not found." >&2
+
+            exit 127
+        ' \
+        9>&- \
+        >>"${LOG_FILE}" 2>&1 &
+
+    LAUNCHER_PID="$!"
+
+    log "INFO" \
+        "Distrobox launcher PID: ${LAUNCHER_PID}"
+}
+
+
+# ------------------------------------------------------------------------------
+# Wait for Project Manager
+# ------------------------------------------------------------------------------
+
+wait_for_project_manager()
+{
+    local deadline=$((SECONDS + WINDOW_TIMEOUT_SECONDS))
+    local launcher_finished=0
+    local launcher_exit_code=0
+
+    while (( SECONDS < deadline )); do
+
+        if find_project_manager; then
+
+            log "INFO" \
+                "Found Project Manager X11 window: ${FOUND_WINDOW}"
+
+            if repair_with_retries "${FOUND_WINDOW}"; then
+
+                notify \
+                    "normal" \
+                    "DaVinci Resolve ready" \
+                    "Project Manager is now visible in Niri."
+
+                return 0
+            fi
+
+            die \
+                "Project Manager was found, but Niri did not accept the window after ${REMAP_ATTEMPTS} repair attempts."
+        fi
+
+
+        # Detect a genuine launcher failure early.
+        if (( launcher_finished == 0 )); then
+
+            if ! kill -0 "${LAUNCHER_PID}" 2>/dev/null; then
+
+                launcher_finished=1
+
+                if wait "${LAUNCHER_PID}"; then
+                    launcher_exit_code=0
+                else
+                    launcher_exit_code="$?"
+                fi
+
+                log "INFO" \
+                    "Distrobox launcher exited with code ${launcher_exit_code}"
+
+                # A wrapper might legitimately detach with exit code 0,
+                # therefore only non-zero is treated as an immediate failure.
+                if (( launcher_exit_code != 0 )); then
+                    die \
+                        "Resolve exited before the Project Manager appeared. Exit code: ${launcher_exit_code}"
+                fi
+            fi
+        fi
+
+        sleep "${POLL_INTERVAL_SECONDS}"
+    done
+
+
+    die \
+        "Timed out after ${WINDOW_TIMEOUT_SECONDS} seconds waiting for the Resolve Project Manager."
+}
+
+
+# ------------------------------------------------------------------------------
+# Main
+# ------------------------------------------------------------------------------
+
+main()
+{
+    load_distroboxes
+
+
+    # --------------------------------------------------------------------------
+    # Avoid starting another Resolve when one is already visible.
+    # --------------------------------------------------------------------------
+
+    if niri_has_resolve_window; then
+
+        notify \
+            "normal" \
+            "DaVinci Resolve" \
+            "Resolve already has a visible window in Niri."
+
+        exit 0
+    fi
+
+
+    # --------------------------------------------------------------------------
+    # If Resolve is already stuck in the known broken state, repair that
+    # existing instance instead of launching another copy.
+    # --------------------------------------------------------------------------
+
+    if find_project_manager; then
+
+        log "INFO" \
+            "Found an existing hidden Project Manager: ${FOUND_WINDOW}"
+
+        notify \
+            "normal" \
+            "DaVinci Resolve" \
+            "Repairing the existing Project Manager window…"
+
+        if repair_with_retries "${FOUND_WINDOW}"; then
+
+            notify \
+                "normal" \
+                "DaVinci Resolve ready" \
+                "Existing Project Manager repaired successfully."
+
+            exit 0
+        fi
+
+        die \
+            "An existing Resolve Project Manager was found but could not be exposed to Niri."
+    fi
+
+
+    # --------------------------------------------------------------------------
+    # Select the Distrobox.
+    #
+    # An optional command-line argument can bypass Rofi:
+    #
+    #   resolve-launcher mybox
+    #
+    # Otherwise Rofi is used.
+    # --------------------------------------------------------------------------
+
+    if (( $# > 1 )); then
+        die "Usage: $(basename "$0") [distrobox-name]"
+    fi
+
+
+    if (( $# == 1 )); then
+
+        SELECTED_BOX="$1"
+
+        if ! box_exists "${SELECTED_BOX}"; then
+            die "Distrobox does not exist: ${SELECTED_BOX}"
+        fi
+
+    else
+        select_distrobox
+    fi
+
+
+    log "INFO" \
+        "Selected Distrobox: ${SELECTED_BOX}"
+
+
+    notify \
+        "normal" \
+        "Starting DaVinci Resolve" \
+        "Container: ${SELECTED_BOX}"
+
+
+    # --------------------------------------------------------------------------
+    # Make sure the user did not accidentally select an unrelated Distrobox.
+    # --------------------------------------------------------------------------
+
+    if ! validate_resolve_installation "${SELECTED_BOX}"; then
+
+        die \
+            "DaVinci Resolve was not found in Distrobox '${SELECTED_BOX}'."
+    fi
+
+
+    launch_resolve "${SELECTED_BOX}"
+
+    wait_for_project_manager
+}
+
+
+main "$@"
