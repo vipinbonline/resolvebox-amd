@@ -1,0 +1,176 @@
+#!/usr/bin/env bash
+
+#SPDX-License-Identifier: Apache-2.0
+
+
+#Derived from davincibox:
+#https://github.com/zelikos/davincibox
+
+
+#Modified for resolvebox-amd, 2026.
+#This file contains changes from the upstream version.
+
+# Upstream base revision:
+# d6b5f768200a2e67f01f961e3de82e40f712a5b6
+#
+# This modifies the user's locally installed DaVinci Resolve binaries
+# to address runtime library compatibility in the container environment.
+
+
+# Copyright 2026 Vipin Balakrishnan (modifications only)
+
+
+
+set -Eeuo pipefail
+IFS=$'\n\t'
+umask 022
+
+readonly SCRIPT_NAME="${0##*/}"
+
+log() {
+    printf '[%s] %s\n' "$SCRIPT_NAME" "$*"
+}
+
+die() {
+    printf '[%s] ERROR: %s\n' "$SCRIPT_NAME" "$*" >&2
+    exit 1
+}
+
+require_command() {
+    command -v "$1" >/dev/null 2>&1 || die "Required command not found: $1"
+}
+
+resolve_container_name() {
+    local expected_name="${1:-}"
+    local detected_name="${CONTAINER_ID:-}"
+
+    [[ -n "$detected_name" ]] \
+        || die "This script must be run inside a Distrobox container. CONTAINER_ID is not set."
+
+    if [[ -n "$expected_name" && "$expected_name" != "$detected_name" ]]; then
+        die "Container mismatch: setup requested '$expected_name', but this container is '$detected_name'."
+    fi
+
+    printf '%s\n' "$detected_name"
+}
+
+main() {
+    local installer_arg="${1:-}"
+    local expected_container="${2:-}"
+    local installer
+    local container_name
+    local response
+    local decoder
+    local lib
+    local -a libs
+    local -a patchelf_args=()
+    local -a decoders
+
+    [[ -n "$installer_arg" ]] || die "Usage: $SCRIPT_NAME <extracted-AppRun> [expected-container-name]"
+    [[ $# -le 2 ]] || die "Usage: $SCRIPT_NAME <extracted-AppRun> [expected-container-name]"
+
+    require_command readlink
+    require_command sudo
+    require_command patchelf
+    require_command find
+
+    container_name="$(resolve_container_name "$expected_container")"
+
+    installer="$(readlink -e -- "$installer_arg")" \
+        || die "Installer path does not exist: $installer_arg"
+    [[ -f "$installer" ]] || die "Installer is not a file: $installer"
+
+    printf '\n'
+    printf '%s\n' \
+    'DaVinci Resolve compatibility workaround' \
+    '' \
+    'resolvebox-amd requires a compatibility workaround for the current' \
+    'container environment.' \
+    '' \
+    'The workaround modifies ELF dynamic dependency metadata in your locally' \
+    'installed copy of DaVinci Resolve using patchelf.' \
+    '' \
+    'Without this workaround, DaVinci Resolve may not start or operate' \
+    'correctly in this resolvebox environment.' \
+    '' \
+    "DaVinci Resolve remains subject to Blackmagic Design's applicable" \
+    'license terms. Review those terms before continuing.' \
+    ''
+
+while true; do
+    read -r -p \
+        "Continue with installation and apply the compatibility workaround? [y/N] " \
+        response
+
+    case "${response,,}" in
+        y|yes)
+            break
+            ;;
+        n|no|"")
+            die "Installation cancelled. The compatibility workaround was not accepted."
+            ;;
+        *)
+            printf 'Please answer yes or no.\n'
+            ;;
+    esac
+done
+
+    log "Container: $container_name"
+    log "Installing DaVinci Resolve..."
+
+    sudo env \
+        QT_QPA_PLATFORM=minimal \
+        SKIP_PACKAGE_CHECK=1 \
+        "$installer" -i -a -y
+
+
+    log "Patching Resolve binaries..."
+
+    libs=(
+        /usr/lib64/libglib-2.0.so.0
+        /usr/lib64/libgdk_pixbuf-2.0.so.0
+        /usr/lib64/libgio-2.0.so.0
+        /usr/lib64/libgmodule-2.0.so.0
+    )
+
+    for lib in "${libs[@]}"; do
+        [[ -e "$lib" ]] || die "Required library not found: $lib"
+        patchelf_args+=(--add-needed "$lib")
+    done
+
+    find /opt/resolve/bin \
+        -type f \
+        -executable \
+        -exec sudo patchelf "${patchelf_args[@]}" {} \;
+
+    log "Applying workaround for companion programs..."
+
+    decoders=(
+        /opt/resolve/BlackmagicRAWPlayer/BlackmagicRawAPI/libDecoderOpenCL.so
+        /opt/resolve/BlackmagicRAWSpeedTest/BlackmagicRawAPI/libDecoderOpenCL.so
+    )
+
+    for decoder in "${decoders[@]}"; do
+        if [[ -f "$decoder" ]]; then
+            sudo mv -f -- "$decoder" "${decoder}.bak"
+        fi
+    done
+
+    response=""
+    if [[ -t 0 ]]; then
+        printf 'Add DaVinci Resolve launcher? [Y/n] '
+        read -r response || true
+    fi
+
+    case "$response" in
+        n|N)
+            log "Launcher creation skipped."
+            printf 'To add it later, enter the container and run:\n  add-davinci-launcher\n'
+            ;;
+        *)
+            /usr/bin/add-davinci-launcher "$container_name"
+            ;;
+    esac
+}
+
+main "$@"

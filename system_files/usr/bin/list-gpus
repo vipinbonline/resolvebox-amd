@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+
+#SPDX-License-Identifier: Apache-2.0
+
+
+#Derived from davincibox:
+#https://github.com/zelikos/davincibox
+
+
+#Modified for resolvebox-amd, 2026.
+#This file contains changes from the upstream version.
+
+
+# Copyright 2026 Vipin Balakrishnan (modifications only)
+
+
+
+set -Eeuo pipefail
+IFS=$'\n\t'
+
+readonly SCRIPT_NAME="${0##*/}"
+readonly AMD_ICD_FILE="/etc/OpenCL/vendors/amdocl64.icd"
+
+die() {
+    printf '[%s] ERROR: %s\n' "$SCRIPT_NAME" "$*" >&2
+    exit 1
+}
+
+main() {
+    [[ -n "${CONTAINER_ID:-}" ]] \
+        || die "This command must be run inside a Distrobox container."
+
+    export DBUS_SYSTEM_BUS_ADDRESS="unix:path=/run/host/var/run/dbus/system_bus_socket"
+
+    printf 'Distrobox: %s\n' "$CONTAINER_ID"
+    printf 'GPU devices visible through switcheroo-control:\n'
+    switcherooctl list
+
+    printf '\nAMD ROCm OpenCL:\n'
+    if [[ -f "$AMD_ICD_FILE" ]]; then
+        printf '  ICD: %s\n' "$AMD_ICD_FILE"
+    else
+        printf '  ERROR: ROCm ICD not found: %s\n' "$AMD_ICD_FILE" >&2
+        return 1
+    fi
+
+    if command -v clinfo >/dev/null 2>&1; then
+        printf '\nOpenCL platforms/devices:\n'
+        OCL_ICD_VENDORS=amdocl64.icd clinfo -l
+    fi
+}
+
+main "$@"

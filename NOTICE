@@ -1,0 +1,44 @@
+resolvebox-amd
+
+Copyright 2026 Vipin Balakrishnan
+(modifications and original contributions only)
+
+This project contains software derived from:
+
+```
+davincibox
+https://github.com/zelikos/davincibox
+```
+
+davincibox is distributed under the Apache License, Version 2.0.
+
+The original davincibox project and its contributors retain copyright
+in their respective contributions.
+
+resolvebox-amd contains substantial modifications to the upstream work,
+including AMD/ROCm-focused operation, Distrobox-only container
+management, local container image construction, Distrobox Assemble
+configuration, configurable container naming, installation workflows,
+launcher integration, and related tooling.
+
+DaVinci Resolve is proprietary software from Blackmagic Design and is
+not distributed or licensed as part of resolvebox-amd.
+
+Third-party software used by or installed through this project remains
+subject to its respective licenses.
+
+DaVinci Resolve, Blackmagic Design, AMD, AMD ROCm, Fedora, Distrobox,
+Podman, and other referenced product or company names may be trademarks
+of their respective owners.
+
+resolvebox-amd is an independent community project and is not affiliated
+with, sponsored by, certified by, approved by, or endorsed by
+Blackmagic Design, Advanced Micro Devices, Inc., the Fedora Project,
+Distrobox, Podman, or the upstream davincibox project.
+
+This NOTICE file is provided for attribution and informational purposes
+only. It does not modify or replace the terms of the Apache License,
+Version 2.0.
+
+See LICENSE for the applicable Apache License 2.0 terms.
+See ATTRIBUTION.md for detailed project and upstream attribution.

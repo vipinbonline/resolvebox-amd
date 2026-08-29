@@ -1,0 +1,43 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# Derived from:
+# https://github.com/zelikos/davincibox/blob/main/davinci-dependencies
+#
+# Modified for resolvebox-amd.
+
+alsa-lib
+apr
+apr-util
+dbus-libs
+glx-utils
+libglvnd-egl
+libglvnd-glx
+libICE
+librsvg2
+libSM
+libxcrypt-compat
+libXcursor
+libXfixes
+libXi
+libXinerama
+libxkbcommon-x11
+libxkbfile
+libXrandr
+libXtst
+libXxf86vm
+mesa-libGLU
+mtdev
+nss
+ocl-icd
+pipewire-alsa
+pulseaudio-libs
+python3-gobject
+switcheroo-control
+xcb-util
+xcb-util-cursor
+xcb-util-image
+xcb-util-keysyms
+xcb-util-renderutil
+xcb-util-wm
+patchelf
+rocm-opencl

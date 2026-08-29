@@ -1,0 +1,14 @@
+This is adding because this configration is derived from https://github.com/zelikos/davincibox github.
+
+I did few changes in this script
+
+- Script now only handle distrobox tool.
+- Removed nvidia depedency
+- Now support compilation of the dockerfile
+- Removed cache
+- Custom name supported by distrobox. Previously it was hardcoded
+- Usage of assemble file in distrobox instead of commands
+Command to execute is
+
+./setup.sh davincibox.ini davinciboxtest  ./DaVinci_Resolve_21.0.4_Linux.run
+./setup.sh davincibox.ini davinciboxtest upgrade ./DaVinci_Resolve_21.0.4_Linux.run

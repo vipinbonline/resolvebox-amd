@@ -1,0 +1,213 @@
+#!/usr/bin/env bash
+
+#SPDX-License-Identifier: Apache-2.0
+
+
+#Derived from davincibox:
+#https://github.com/zelikos/davincibox
+
+
+#Modified for resolvebox-amd, 2026.
+#This file contains changes from the upstream version.
+
+
+# Copyright 2026 Vipin Balakrishnan (modifications only)
+
+
+
+set -Eeuo pipefail
+IFS=$'\n\t'
+umask 022
+
+readonly SCRIPT_NAME="${0##*/}"
+
+log() {
+    printf '[%s] %s\n' "$SCRIPT_NAME" "$*"
+}
+
+die() {
+    printf '[%s] ERROR: %s\n' "$SCRIPT_NAME" "$*" >&2
+    exit 1
+}
+
+resolve_container_name() {
+    local expected_name="${1:-}"
+    local detected_name="${CONTAINER_ID:-}"
+
+    [[ -n "$detected_name" ]] \
+        || die "This script must be run inside a Distrobox container."
+
+    if [[ -n "$expected_name" && "$expected_name" != "$detected_name" ]]; then
+        die "Container mismatch: requested '$expected_name', current Distrobox is '$detected_name'."
+    fi
+
+    printf '%s\n' "$detected_name"
+}
+
+append_if_exists() {
+    local file_path="$1"
+    local content="$2"
+
+    [[ -f "$file_path" ]] || return 0
+
+    if grep -Fxq -- "$content" "$file_path"; then
+        return 0
+    fi
+
+    if [[ -s "$file_path" && -n "$(tail -c 1 -- "$file_path")" ]]; then
+        printf '\n' >> "$file_path"
+    fi
+
+    printf '%s\n' "$content" >> "$file_path"
+}
+
+host_paths() {
+    HOST_HOME="${DISTROBOX_HOST_HOME:-$HOME}"
+
+    if [[ -d "/run/host${HOST_HOME}" ]]; then
+        HOST_HOME_FS="/run/host${HOST_HOME}"
+    else
+        HOST_HOME_FS="$HOST_HOME"
+    fi
+
+    APPS_DIR="$HOST_HOME_FS/.local/share/applications"
+    ICONS_DIR="$HOST_HOME_FS/.local/share/icons/hicolor"
+    RESOLVE_DATA_DIR="$HOST_HOME_FS/.local/share/resolve"
+    DESKTOP_SHORTCUT="$HOST_HOME_FS/Desktop/com.blackmagicdesign.resolve.desktop"
+}
+
+remove_launchers() {
+    log "Removing DaVinci Resolve launchers from host..."
+
+    rm -rf -- "$RESOLVE_DATA_DIR/graphics"
+
+    rm -f -- \
+        "$ICONS_DIR/256x256/mimetypes/application-x-braw-clip.png" \
+        "$ICONS_DIR/48x48/mimetypes/application-x-braw-clip.png" \
+        "$ICONS_DIR/256x256/mimetypes/application-x-braw-sidecar.png" \
+        "$ICONS_DIR/48x48/mimetypes/application-x-braw-sidecar.png" \
+        "$ICONS_DIR/256x256/apps/blackmagicraw-player.png" \
+        "$ICONS_DIR/48x48/apps/blackmagicraw-player.png" \
+        "$ICONS_DIR/256x256/apps/blackmagicraw-speedtest.png" \
+        "$ICONS_DIR/48x48/apps/blackmagicraw-speedtest.png"
+
+    rm -f -- \
+        "$APPS_DIR"/blackmagicraw*.desktop \
+        "$APPS_DIR"/DaVinci*.desktop \
+        "$DESKTOP_SHORTCUT"
+
+    log "Launcher removal complete."
+}
+
+copy_graphics() {
+    log "Copying DaVinci Resolve graphics to host..."
+
+    mkdir -p -- \
+        "$RESOLVE_DATA_DIR/graphics" \
+        "$ICONS_DIR/48x48/apps" \
+        "$ICONS_DIR/48x48/mimetypes" \
+        "$ICONS_DIR/256x256/apps" \
+        "$ICONS_DIR/256x256/mimetypes"
+
+    cp -f /opt/resolve/graphics/DV_* "$RESOLVE_DATA_DIR/graphics/"
+
+    cp -f /opt/resolve/graphics/application-x-braw-clip_256x256_mimetypes.png \
+        "$ICONS_DIR/256x256/mimetypes/application-x-braw-clip.png"
+    cp -f /opt/resolve/graphics/application-x-braw-clip_48x48_mimetypes.png \
+        "$ICONS_DIR/48x48/mimetypes/application-x-braw-clip.png"
+    cp -f /opt/resolve/graphics/application-x-braw-sidecar_256x256_mimetypes.png \
+        "$ICONS_DIR/256x256/mimetypes/application-x-braw-sidecar.png"
+    cp -f /opt/resolve/graphics/application-x-braw-sidecar_48x48_mimetypes.png \
+        "$ICONS_DIR/48x48/mimetypes/application-x-braw-sidecar.png"
+    cp -f /opt/resolve/graphics/blackmagicraw-player_256x256_apps.png \
+        "$ICONS_DIR/256x256/apps/blackmagicraw-player.png"
+    cp -f /opt/resolve/graphics/blackmagicraw-player_48x48_apps.png \
+        "$ICONS_DIR/48x48/apps/blackmagicraw-player.png"
+    cp -f /opt/resolve/graphics/blackmagicraw-speedtest_256x256_apps.png \
+        "$ICONS_DIR/256x256/apps/blackmagicraw-speedtest.png"
+    cp -f /opt/resolve/graphics/blackmagicraw-speedtest_48x48_apps.png \
+        "$ICONS_DIR/48x48/apps/blackmagicraw-speedtest.png"
+}
+
+setup_launchers() {
+    local container_name="$1"
+    local container_run_command
+    local desktop_file
+    local -a desktop_files
+
+    log "Creating host launchers for Distrobox '$container_name'..."
+
+    mkdir -p -- "$APPS_DIR"
+    cp -f /opt/resolve/share/*.desktop "$APPS_DIR/"
+
+    # The container is managed by setup.sh, so expose no Resolve uninstaller.
+    rm -f -- "$APPS_DIR/DaVinciResolveInstaller.desktop"
+
+    shopt -s nullglob
+    desktop_files=(
+        "$APPS_DIR"/blackmagicraw*.desktop
+        "$APPS_DIR"/DaVinci*.desktop
+    )
+    shopt -u nullglob
+
+    ((${#desktop_files[@]} > 0)) \
+        || die "No DaVinci Resolve desktop files were copied from /opt/resolve/share."
+
+    container_run_command="distrobox enter --name ${container_name} -- /usr/bin/run-davinci"
+
+    for desktop_file in "${desktop_files[@]}"; do
+        sed -i \
+            -e 's|RESOLVE_INSTALL_LOCATION|/opt/resolve|g' \
+            -e "s|^Icon=/opt/resolve/graphics|Icon=${HOST_HOME}/.local/share/resolve/graphics|" \
+            -e "s|^Path=.*|Path=${HOST_HOME}|" \
+            -e "s|^Exec=|Exec=${container_run_command} |" \
+            "$desktop_file"
+    done
+
+    append_if_exists "$APPS_DIR/blackmagicraw-player.desktop" \
+        "StartupWMClass=Blackmagic RAW Player"
+    append_if_exists "$APPS_DIR/blackmagicraw-speedtest.desktop" \
+        "StartupWMClass=Blackmagic RAW Speed Test"
+    append_if_exists "$APPS_DIR/DaVinciControlPanelsSetup.desktop" \
+        "StartupWMClass=DaVinci Control Panels Setup"
+    append_if_exists "$APPS_DIR/DaVinciRemoteMonitoring.desktop" \
+        "StartupWMClass=DaVinci Remote Monitor"
+    append_if_exists "$APPS_DIR/DaVinciResolve.desktop" \
+        "StartupWMClass=resolve"
+
+    if [[ -f "$DESKTOP_SHORTCUT" ]]; then
+        log "Updating existing desktop shortcut..."
+        cp -f -- "$APPS_DIR/DaVinciResolve.desktop" "$DESKTOP_SHORTCUT"
+    fi
+
+    log "Launcher setup complete."
+    log "Container used by launchers: $container_name"
+}
+
+main() {
+    local action="install"
+    local expected_container=""
+    local container_name
+
+    if [[ "${1:-}" == "remove" ]]; then
+        action="remove"
+        expected_container="${2:-}"
+        [[ $# -le 2 ]] || die "Usage: $SCRIPT_NAME remove [expected-container-name]"
+    else
+        expected_container="${1:-}"
+        [[ $# -le 1 ]] || die "Usage: $SCRIPT_NAME [expected-container-name]"
+    fi
+
+    container_name="$(resolve_container_name "$expected_container")"
+    host_paths
+
+    if [[ "$action" == "remove" ]]; then
+        remove_launchers
+        return 0
+    fi
+
+    copy_graphics
+    setup_launchers "$container_name"
+}
+
+main "$@"

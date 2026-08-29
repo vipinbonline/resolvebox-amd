@@ -1,0 +1,106 @@
+#!/usr/bin/env bash
+
+#SPDX-License-Identifier: Apache-2.0
+
+
+#Derived from davincibox:
+#https://github.com/zelikos/davincibox
+
+
+#Modified for resolvebox-amd, 2026.
+#This file contains changes from the upstream version.
+
+
+# Copyright 2026 Vipin Balakrishnan (modifications only)
+
+
+
+set -Eeuo pipefail
+IFS=$'\n\t'
+umask 022
+
+readonly SCRIPT_NAME="${0##*/}"
+readonly AMD_ICD_FILE="/etc/OpenCL/vendors/amdocl64.icd"
+readonly DEFAULT_DAVINCI_BIN="/opt/resolve/bin/resolve"
+
+export QT_QPA_PLATFORM=xcb
+export QT_AUTO_SCREEN_SCALE_FACTOR=1
+
+# This image is AMD/ROCm only. Restrict the OpenCL loader to the AMD ROCm ICD.
+export OCL_ICD_VENDORS=amdocl64.icd
+
+HOST_LINKS=(
+    "/run/host/usr/OFX/Plugins:/usr/OFX/Plugins"
+)
+
+die() {
+    printf '[%s] ERROR: %s\n' "$SCRIPT_NAME" "$*" >&2
+    exit 1
+}
+
+require_distrobox() {
+    [[ -n "${CONTAINER_ID:-}" ]] \
+        || die "This command must be run inside a Distrobox container."
+}
+
+link_host_paths() {
+    local entry
+    local host_path
+    local container_path
+    local current_target
+
+    for entry in "${HOST_LINKS[@]}"; do
+        host_path="${entry%%:*}"
+        container_path="${entry#*:}"
+
+        [[ -d "$host_path" ]] || continue
+
+        if [[ -L "$container_path" ]]; then
+            current_target="$(readlink -- "$container_path" || true)"
+            if [[ "$current_target" == "$host_path" ]]; then
+                continue
+            fi
+        elif [[ -d "$container_path" ]] \
+            && find "$container_path" -mindepth 1 -maxdepth 1 -print -quit | grep -q .; then
+            printf '[%s] WARNING: not replacing non-empty path: %s\n' \
+                "$SCRIPT_NAME" "$container_path" >&2
+            continue
+        fi
+
+        sudo mkdir -p -- "$(dirname -- "$container_path")"
+        sudo rm -rf -- "$container_path"
+        sudo ln -s -- "$host_path" "$container_path"
+    done
+}
+
+main() {
+    local davinci_bin="$DEFAULT_DAVINCI_BIN"
+
+    require_distrobox
+
+    [[ -f "$AMD_ICD_FILE" ]] \
+        || die "AMD ROCm OpenCL ICD not found: $AMD_ICD_FILE"
+
+    # Desktop launchers pass the DaVinci/Blackmagic executable as the first
+    # argument. If the first argument is an executable, use it as the program;
+    # otherwise keep the default Resolve binary and treat all arguments as
+    # Resolve arguments/files/URIs.
+    if [[ $# -gt 0 && -x "$1" ]]; then
+        davinci_bin="$(readlink -e -- "$1")" \
+            || die "DaVinci executable not found: $1"
+        shift
+    elif [[ $# -gt 0 && "$1" == /opt/resolve/* ]]; then
+        die "DaVinci executable not found or not executable: $1"
+    fi
+
+    [[ -f "$davinci_bin" && -x "$davinci_bin" ]] \
+        || die "DaVinci executable is not executable: $davinci_bin"
+
+    link_host_paths
+
+    export DBUS_SYSTEM_BUS_ADDRESS="unix:path=/run/host/var/run/dbus/system_bus_socket"
+
+    exec switcherooctl launch "$davinci_bin" "$@"
+}
+
+main "$@"
