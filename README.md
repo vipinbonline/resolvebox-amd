@@ -594,7 +594,7 @@ The normal Distrobox installation must exist before using this helper.
 Clone `resolvebox-amd`:
 
 ```bash
-git clone https://github.com/<your-github-username>/resolvebox-amd.git
+git clone https://github.com/vipinbonline/resolvebox-amd.git
 ```
 
 Enter the repository:
