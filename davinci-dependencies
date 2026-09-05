@@ -29,7 +29,8 @@ mesa-libGLU
 mtdev
 nss
 ocl-icd
-pipewire-alsa
+#pipewire-alsa
+alsa-plugins-pulseaudio
 pulseaudio-libs
 python3-gobject
 switcheroo-control
